@@ -4,6 +4,8 @@ import plotly.express as px
 from datetime import datetime, date
 import os
 import io
+import psycopg2
+import psycopg2.extras
 
 st.set_page_config(
     page_title="Burgers Express - Gestión",
@@ -158,13 +160,28 @@ div.stDownloadButton > button:hover {{
 </style>
 """, unsafe_allow_html=True)
 
-# ─── ARCHIVOS DE PERSISTENCIA ─────────────────────────────────────────────────
-VENTAS_FILE = "data_ventas.csv"
-GASTOS_FILE = "data_gastos.csv"
-INVENTARIO_FILE = "data_inventario.csv"
-MOVIMIENTOS_FILE = "data_movimientos_inv.csv"
+# ─── BASE DE DATOS ─────────────────────────────────────────────────────────────
+PRECIOS_DEFAULT = {
+    "Combo Simple": 0.0,
+    "Combo Doble": 0.0,
+    "Porción de Papas": 0.0,
+}
 
-VENTAS_COLS = ["Fecha", "Cliente", "Producto", "Cantidad", "Precio Unitario", "Total", "Notas"]
+def get_conn():
+    url = os.environ.get("DATABASE_URL")
+    if not url:
+        st.error("⚠️ DATABASE_URL no está configurada. Agregá el secret en Streamlit Cloud.")
+        st.stop()
+    return psycopg2.connect(url)
+
+
+def drop_meta(df: pd.DataFrame) -> pd.DataFrame:
+    return df.drop(columns=[c for c in df.columns if c.startswith("_")], errors="ignore")
+
+VENTAS_COLS = ["Fecha", "Cliente", "Domicilio/Retiro",
+               "Cant. Combo Simple", "Cant. Combo Doble", "Cantidad Papas",
+               "Precio Combo Simple", "Precio Combo Doble", "Precio Papas",
+               "Total", "Forma de Pago"]
 GASTOS_COLS = ["Fecha", "Descripción", "Categoría", "Monto", "Notas"]
 INVENTARIO_COLS = ["Producto", "Categoría", "Unidad", "Stock Actual", "Stock Mínimo", "Costo Unitario"]
 MOVIMIENTOS_COLS = ["Fecha", "Producto", "Tipo", "Cantidad", "Stock Resultante", "Notas"]
@@ -223,63 +240,226 @@ def fmt_num(value, decimals=2):
         return "-"
 
 
-# ─── CARGA / GUARDADO CSV ─────────────────────────────────────────────────────
-def load_ventas():
-    if os.path.exists(VENTAS_FILE):
-        return pd.read_csv(VENTAS_FILE, parse_dates=["Fecha"])
-    return pd.DataFrame(columns=VENTAS_COLS)
-
-
-def load_gastos():
-    if os.path.exists(GASTOS_FILE):
-        return pd.read_csv(GASTOS_FILE, parse_dates=["Fecha"])
-    return pd.DataFrame(columns=GASTOS_COLS)
-
-
-def load_inventario():
-    if os.path.exists(INVENTARIO_FILE):
-        return pd.read_csv(INVENTARIO_FILE)
-    return pd.DataFrame(columns=INVENTARIO_COLS)
-
-
-def load_movimientos():
-    if os.path.exists(MOVIMIENTOS_FILE):
-        return pd.read_csv(MOVIMIENTOS_FILE, parse_dates=["Fecha"])
-    return pd.DataFrame(columns=MOVIMIENTOS_COLS)
-
-
-def save_ventas(df):
-    df.to_csv(VENTAS_FILE, index=False)
-
-
-def save_gastos(df):
-    df.to_csv(GASTOS_FILE, index=False)
-
-
-def save_inventario(df):
-    df.to_csv(INVENTARIO_FILE, index=False)
-
-
-def save_movimientos(df):
-    df.to_csv(MOVIMIENTOS_FILE, index=False)
+# ─── CAPA DE DATOS (PostgreSQL) ───────────────────────────────────────────────
+def load_ventas() -> pd.DataFrame:
+    try:
+        conn = get_conn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            "SELECT id AS _id, fecha AS \"Fecha\", cliente AS \"Cliente\","
+            " domicilio_retiro AS \"Domicilio/Retiro\","
+            " cant_combo_simple AS \"Cant. Combo Simple\","
+            " cant_combo_doble AS \"Cant. Combo Doble\","
+            " cantidad_papas AS \"Cantidad Papas\","
+            " precio_combo_simple AS \"Precio Combo Simple\","
+            " precio_combo_doble AS \"Precio Combo Doble\","
+            " precio_papas AS \"Precio Papas\","
+            " total AS \"Total\", forma_pago AS \"Forma de Pago\""
+            " FROM ventas ORDER BY fecha DESC, id DESC"
+        )
+        rows = cur.fetchall()
+        conn.close()
+        df = pd.DataFrame([dict(r) for r in rows]) if rows else pd.DataFrame(columns=["_id"] + VENTAS_COLS)
+        df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
+        return df
+    except Exception as e:
+        st.error(f"Error al cargar ventas: {e}")
+        return pd.DataFrame(columns=["_id"] + VENTAS_COLS)
 
 
 def append_venta(row: dict):
-    df = load_ventas()
-    df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-    save_ventas(df)
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO ventas (fecha,cliente,domicilio_retiro,cant_combo_simple,"
+        "cant_combo_doble,cantidad_papas,precio_combo_simple,precio_combo_doble,"
+        "precio_papas,total,forma_pago) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+        (
+            row["Fecha"], row["Cliente"], row["Domicilio/Retiro"],
+            int(row.get("Cant. Combo Simple", 0)),
+            int(row.get("Cant. Combo Doble", 0)),
+            int(row.get("Cantidad Papas", 0)),
+            float(row.get("Precio Combo Simple", 0)),
+            float(row.get("Precio Combo Doble", 0)),
+            float(row.get("Precio Papas", 0)),
+            float(row["Total"]),
+            row["Forma de Pago"],
+        )
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_ventas(ids: list):
+    if not ids:
+        return
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM ventas WHERE id = ANY(%s)", (ids,))
+    conn.commit()
+    conn.close()
+
+
+def load_gastos() -> pd.DataFrame:
+    try:
+        conn = get_conn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            "SELECT id AS _id, fecha AS \"Fecha\","
+            " descripcion AS \"Descripción\", categoria AS \"Categoría\","
+            " monto AS \"Monto\", notas AS \"Notas\""
+            " FROM gastos ORDER BY fecha DESC, id DESC"
+        )
+        rows = cur.fetchall()
+        conn.close()
+        df = pd.DataFrame([dict(r) for r in rows]) if rows else pd.DataFrame(columns=["_id"] + GASTOS_COLS)
+        df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
+        return df
+    except Exception as e:
+        st.error(f"Error al cargar gastos: {e}")
+        return pd.DataFrame(columns=["_id"] + GASTOS_COLS)
 
 
 def append_gasto(row: dict):
-    df = load_gastos()
-    df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-    save_gastos(df)
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO gastos (fecha,descripcion,categoria,monto,notas) VALUES (%s,%s,%s,%s,%s)",
+        (row["Fecha"], row["Descripción"], row["Categoría"],
+         float(row["Monto"]), row.get("Notas", ""))
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_gastos(ids: list):
+    if not ids:
+        return
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM gastos WHERE id = ANY(%s)", (ids,))
+    conn.commit()
+    conn.close()
+
+
+def load_inventario() -> pd.DataFrame:
+    try:
+        conn = get_conn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            "SELECT id AS _id, producto AS \"Producto\", categoria AS \"Categoría\","
+            " unidad AS \"Unidad\", stock_actual AS \"Stock Actual\","
+            " stock_minimo AS \"Stock Mínimo\", costo_unitario AS \"Costo Unitario\""
+            " FROM inventario ORDER BY producto"
+        )
+        rows = cur.fetchall()
+        conn.close()
+        return pd.DataFrame([dict(r) for r in rows]) if rows else pd.DataFrame(columns=["_id"] + INVENTARIO_COLS)
+    except Exception as e:
+        st.error(f"Error al cargar inventario: {e}")
+        return pd.DataFrame(columns=["_id"] + INVENTARIO_COLS)
+
+
+def insert_inventario(row: dict):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO inventario (producto,categoria,unidad,stock_actual,stock_minimo,costo_unitario)"
+        " VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT (producto) DO NOTHING",
+        (row["Producto"], row["Categoría"], row["Unidad"],
+         float(row["Stock Actual"]), float(row["Stock Mínimo"]), float(row["Costo Unitario"]))
+    )
+    conn.commit()
+    conn.close()
+
+
+def update_stock_inventario(producto: str, nuevo_stock: float):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE inventario SET stock_actual = %s WHERE producto = %s",
+                (round(nuevo_stock, 3), producto))
+    conn.commit()
+    conn.close()
+
+
+def update_inventario(old_producto: str, nuevo_nombre: str, nueva_cat: str,
+                      nueva_unidad: str, nuevo_stock_min: float, nuevo_costo: float):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE inventario SET producto=%s, categoria=%s, unidad=%s,"
+        " stock_minimo=%s, costo_unitario=%s WHERE producto=%s",
+        (nuevo_nombre, nueva_cat, nueva_unidad,
+         round(nuevo_stock_min, 3), round(nuevo_costo, 2), old_producto)
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_inventario(producto: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM inventario WHERE producto = %s", (producto,))
+    conn.commit()
+    conn.close()
+
+
+def load_movimientos() -> pd.DataFrame:
+    try:
+        conn = get_conn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            "SELECT id AS _id, fecha AS \"Fecha\", producto AS \"Producto\","
+            " tipo AS \"Tipo\", cantidad AS \"Cantidad\","
+            " stock_resultante AS \"Stock Resultante\", notas AS \"Notas\""
+            " FROM movimientos_inv ORDER BY fecha DESC, id DESC"
+        )
+        rows = cur.fetchall()
+        conn.close()
+        df = pd.DataFrame([dict(r) for r in rows]) if rows else pd.DataFrame(columns=["_id"] + MOVIMIENTOS_COLS)
+        df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce")
+        return df
+    except Exception as e:
+        st.error(f"Error al cargar movimientos: {e}")
+        return pd.DataFrame(columns=["_id"] + MOVIMIENTOS_COLS)
 
 
 def append_movimiento(row: dict):
-    df = load_movimientos()
-    df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-    save_movimientos(df)
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO movimientos_inv (fecha,producto,tipo,cantidad,stock_resultante,notas)"
+        " VALUES (%s,%s,%s,%s,%s,%s)",
+        (row["Fecha"], row["Producto"], row["Tipo"],
+         float(row["Cantidad"]), float(row["Stock Resultante"]), row.get("Notas", ""))
+    )
+    conn.commit()
+    conn.close()
+
+
+def load_precios() -> dict:
+    try:
+        conn = get_conn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT producto, precio FROM precios")
+        rows = cur.fetchall()
+        conn.close()
+        return {r["producto"]: float(r["precio"]) for r in rows} if rows else PRECIOS_DEFAULT.copy()
+    except Exception:
+        return PRECIOS_DEFAULT.copy()
+
+
+def save_precios(precios: dict):
+    conn = get_conn()
+    cur = conn.cursor()
+    for producto, precio in precios.items():
+        cur.execute(
+            "INSERT INTO precios (producto, precio) VALUES (%s,%s)"
+            " ON CONFLICT (producto) DO UPDATE SET precio=EXCLUDED.precio",
+            (producto, float(precio))
+        )
+    conn.commit()
+    conn.close()
 
 
 def get_estado_stock(actual, minimo):
@@ -332,6 +512,7 @@ tabs = st.tabs([
     "📦 Inventario",
     "🤝 Historial Ventas",
     "💸 Historial Gastos",
+    "💰 Precios",
     "📂 Importar Excel",
 ])
 
@@ -372,12 +553,20 @@ with tabs[0]:
 
         with col_r1:
             if not df_v_all.empty:
-                prod_counts = df_v_all.groupby("Producto")["Total"].sum().reset_index()
-                fig = px.pie(prod_counts, values="Total", names="Producto",
-                             hole=0.4, title="Ingresos por Producto",
-                             color_discrete_sequence=["#92e27a","#6ed45a","#4fc43a","#2d6a1f","#b8f0a4","#ffd166","#ffb733","#e8a020"])
-                fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
-                st.plotly_chart(fig, use_container_width=True)
+                if "Cant. Combo Simple" in df_v_all.columns and "Cant. Combo Doble" in df_v_all.columns:
+                    tot_s = df_v_all["Cant. Combo Simple"].sum()
+                    tot_d = df_v_all["Cant. Combo Doble"].sum()
+                    df_combos = pd.DataFrame({
+                        "Tipo": ["Combo Simple", "Combo Doble"],
+                        "Cantidad": [tot_s, tot_d]
+                    })
+                    df_combos = df_combos[df_combos["Cantidad"] > 0]
+                    if not df_combos.empty:
+                        fig = px.pie(df_combos, values="Cantidad", names="Tipo",
+                                     hole=0.4, title="Combos vendidos por tipo",
+                                     color_discrete_sequence=["#92e27a","#ffd166"])
+                        fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+                        st.plotly_chart(fig, use_container_width=True)
 
         with col_r2:
             if not df_g_all.empty:
@@ -422,45 +611,91 @@ with tabs[0]:
 with tabs[1]:
     st.header("Registrar Nueva Venta")
 
+    precios_act = load_precios()
+    precio_simple_act = precios_act.get("Combo Simple", 0.0)
+    precio_doble_act  = precios_act.get("Combo Doble", 0.0)
+    precio_papas_act  = precios_act.get("Porción de Papas", 0.0)
+
+    if precio_simple_act == 0 and precio_doble_act == 0 and precio_papas_act == 0:
+        st.warning("⚠️ Los precios están en $0. Configurá los precios en la pestaña **💰 Precios** antes de registrar ventas.")
+
+    # Mostrar precios vigentes
+    pc1, pc2, pc3 = st.columns(3)
+    pc1.metric("Combo Simple vigente", fmt_currency(precio_simple_act))
+    pc2.metric("Combo Doble vigente",  fmt_currency(precio_doble_act))
+    pc3.metric("Porción de Papas vigente", fmt_currency(precio_papas_act))
+
+    st.markdown("---")
+
     with st.form("form_venta", clear_on_submit=True):
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
+
         with col1:
-            fecha_v = st.date_input("Fecha", value=date.today())
-            cliente_v = st.text_input("Cliente", placeholder="Nombre del cliente (opcional)")
-            producto_v = st.selectbox("Producto / Combo", PRODUCTOS_VENTA)
-            otro_producto = st.text_input("Si elegiste 'Otro', especificá cuál:")
+            fecha_v     = st.date_input("Fecha de la venta", value=date.today())
+            cliente_v   = st.text_input("Cliente", placeholder="Nombre del cliente")
+            domicilio_v = st.text_input("Domicilio de envío", placeholder="Dirección o dejá vacío si retiró")
+            retiro_v    = st.checkbox("¿Retiró en el local?")
+
         with col2:
-            cantidad_v = st.number_input("Cantidad", min_value=1, step=1, value=1)
-            precio_v = st.number_input("Precio Unitario ($)", min_value=0.0, step=0.5, format="%.2f")
-            total_v = cantidad_v * precio_v
-            st.metric("Total de la venta", fmt_currency(total_v))
-            notas_v = st.text_area("Notas (opcional)", placeholder="Cualquier observación...")
+            st.markdown("**Combos**")
+            cant_simples_v = st.number_input("Cantidad Combo Simple", min_value=0, step=1, value=0)
+            cant_dobles_v  = st.number_input("Cantidad Combo Doble",  min_value=0, step=1, value=0)
+            st.markdown("**Papas**")
+            cant_papas_v   = st.number_input("Porciones de papas",    min_value=0, step=1, value=0)
+            forma_pago_v   = st.selectbox("Forma de pago", ["Efectivo", "Transferencia"])
+
+        with col3:
+            st.markdown("**Detalle del total:**")
+            subtotal_simples = cant_simples_v * precio_simple_act
+            subtotal_dobles  = cant_dobles_v  * precio_doble_act
+            subtotal_papas   = cant_papas_v   * precio_papas_act
+            total_v          = subtotal_simples + subtotal_dobles + subtotal_papas
+
+            if cant_simples_v > 0:
+                st.markdown(f"🍔 Combo Simple × {cant_simples_v} @ {fmt_currency(precio_simple_act)} = **{fmt_currency(subtotal_simples)}**")
+            if cant_dobles_v > 0:
+                st.markdown(f"🍔🍔 Combo Doble × {cant_dobles_v} @ {fmt_currency(precio_doble_act)} = **{fmt_currency(subtotal_dobles)}**")
+            if cant_papas_v > 0:
+                st.markdown(f"🍟 Papas × {cant_papas_v} @ {fmt_currency(precio_papas_act)} = **{fmt_currency(subtotal_papas)}**")
+
+            st.metric("💰 Total de la venta", fmt_currency(total_v))
 
         submitted_v = st.form_submit_button("✅ Registrar Venta", use_container_width=True)
 
     if submitted_v:
-        if precio_v <= 0:
-            st.error("El precio unitario debe ser mayor a $0.")
+        if cant_simples_v == 0 and cant_dobles_v == 0 and cant_papas_v == 0:
+            st.error("Ingresá al menos 1 combo o 1 porción de papas.")
         else:
-            producto_final = otro_producto.strip() if producto_v == "Otro" and otro_producto.strip() else producto_v
+            domicilio_final = "Retiró en local" if retiro_v else (domicilio_v.strip() or "Sin especificar")
+            resumen = []
+            if cant_simples_v > 0: resumen.append(f"Simple ×{cant_simples_v}")
+            if cant_dobles_v  > 0: resumen.append(f"Doble ×{cant_dobles_v}")
+            if cant_papas_v   > 0: resumen.append(f"Papas ×{cant_papas_v}")
             append_venta({
-                "Fecha": fecha_v.strftime("%Y-%m-%d"),
-                "Cliente": cliente_v.strip() or "Mostrador",
-                "Producto": producto_final,
-                "Cantidad": int(cantidad_v),
-                "Precio Unitario": precio_v,
-                "Total": round(total_v, 2),
-                "Notas": notas_v.strip(),
+                "Fecha":              fecha_v.strftime("%Y-%m-%d"),
+                "Cliente":            cliente_v.strip() or "Mostrador",
+                "Domicilio/Retiro":   domicilio_final,
+                "Cant. Combo Simple": int(cant_simples_v),
+                "Cant. Combo Doble":  int(cant_dobles_v),
+                "Cantidad Papas":     int(cant_papas_v),
+                "Precio Combo Simple": precio_simple_act,
+                "Precio Combo Doble":  precio_doble_act,
+                "Precio Papas":        precio_papas_act,
+                "Total":               round(total_v, 2),
+                "Forma de Pago":       forma_pago_v,
             })
-            st.success(f"Venta registrada: {producto_final} x{int(cantidad_v)} — {fmt_currency(total_v)}")
+            st.success(f"✅ Venta registrada — {' + '.join(resumen)} → **{fmt_currency(total_v)}** ({forma_pago_v})")
             st.rerun()
 
     st.markdown("---")
     st.subheader("Últimas 5 ventas registradas")
     df_recientes_v = load_ventas()
     if not df_recientes_v.empty:
-        st.dataframe(df_recientes_v.tail(5)[["Fecha", "Cliente", "Producto", "Cantidad", "Total"]],
-                     use_container_width=True, hide_index=True)
+        cols_show_rec = [c for c in ["Fecha", "Cliente", "Domicilio/Retiro",
+                                      "Cant. Combo Simple", "Cant. Combo Doble",
+                                      "Cantidad Papas", "Total", "Forma de Pago"]
+                         if c in df_recientes_v.columns]
+        st.dataframe(df_recientes_v.tail(5)[cols_show_rec], use_container_width=True, hide_index=True)
     else:
         st.info("Todavía no hay ventas registradas.")
 
@@ -638,8 +873,7 @@ with tabs[3]:
                         nuevo_stock = cantidad_mov
                         tipo_label = "Ajuste"
 
-                    df_inv_upd.at[idx, "Stock Actual"] = round(nuevo_stock, 3)
-                    save_inventario(df_inv_upd)
+                    update_stock_inventario(producto_sel, nuevo_stock)
 
                     append_movimiento({
                         "Fecha": fecha_mov.strftime("%Y-%m-%d"),
@@ -694,8 +928,7 @@ with tabs[3]:
                         "Stock Mínimo": round(stock_minimo, 3),
                         "Costo Unitario": round(costo_unitario, 2),
                     }
-                    df_inv_new = pd.concat([df_inv_check, pd.DataFrame([nuevo])], ignore_index=True)
-                    save_inventario(df_inv_new)
+                    insert_inventario(nuevo)
 
                     if stock_inicial > 0:
                         append_movimiento({
@@ -715,7 +948,7 @@ with tabs[3]:
         if not df_inv_preview.empty:
             st.markdown("---")
             st.subheader("Inventario actual")
-            st.dataframe(df_inv_preview, use_container_width=True, hide_index=True)
+            st.dataframe(drop_meta(df_inv_preview), use_container_width=True, hide_index=True)
 
     # ── SUB-TAB D: HISTORIAL DE MOVIMIENTOS ──────────────────────────────────
     with inv_sub[3]:
@@ -747,7 +980,7 @@ with tabs[3]:
             m2.metric("Total salidas", fmt_num(salidas, 3))
             m3.metric("Registros", str(len(df_mov_f)))
 
-            st.dataframe(df_mov_f, use_container_width=True, hide_index=True)
+            st.dataframe(drop_meta(df_mov_f), use_container_width=True, hide_index=True)
 
             csv_mov = df_mov_f.to_csv(index=False).encode("utf-8")
             st.download_button("⬇️ Descargar CSV", data=csv_mov,
@@ -795,18 +1028,13 @@ with tabs[3]:
                                                           type="secondary")
 
             if guardar_edit:
-                df_inv_edit.at[idx_edit, "Producto"] = nuevo_nombre.strip()
-                df_inv_edit.at[idx_edit, "Categoría"] = nueva_cat
-                df_inv_edit.at[idx_edit, "Unidad"] = nueva_unidad
-                df_inv_edit.at[idx_edit, "Stock Mínimo"] = round(nuevo_stock_min, 3)
-                df_inv_edit.at[idx_edit, "Costo Unitario"] = round(nuevo_costo, 2)
-                save_inventario(df_inv_edit)
+                update_inventario(producto_editar, nuevo_nombre.strip(), nueva_cat,
+                                  nueva_unidad, nuevo_stock_min, nuevo_costo)
                 st.success(f"Producto **{nuevo_nombre.strip()}** actualizado correctamente.")
                 st.rerun()
 
             if eliminar_prod:
-                df_inv_edit = df_inv_edit.drop(index=idx_edit).reset_index(drop=True)
-                save_inventario(df_inv_edit)
+                delete_inventario(producto_editar)
                 st.success(f"Producto **{producto_editar}** eliminado del inventario.")
                 st.rerun()
 
@@ -826,22 +1054,28 @@ with tabs[4]:
         with col_f2:
             fecha_hasta = st.date_input("Hasta", value=date.today(), key="hv_hasta")
         with col_f3:
-            filtro_prod = st.multiselect("Producto", options=df_hv["Producto"].unique().tolist(), default=[])
+            filtro_pago = st.multiselect("Forma de pago", options=["Efectivo", "Transferencia"], default=[])
 
         mask = (df_hv["Fecha"].dt.date >= fecha_desde) & (df_hv["Fecha"].dt.date <= fecha_hasta)
-        if filtro_prod:
-            mask = mask & df_hv["Producto"].isin(filtro_prod)
+        if filtro_pago and "Forma de Pago" in df_hv.columns:
+            mask = mask & df_hv["Forma de Pago"].isin(filtro_pago)
         df_filtrado_v = df_hv[mask]
 
-        total_f = df_filtrado_v["Total"].sum()
-        ticket_f = df_filtrado_v["Total"].mean() if not df_filtrado_v.empty else 0
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Total del período", fmt_currency(total_f))
-        c2.metric("Ticket promedio", fmt_currency(ticket_f))
-        c3.metric("Ventas", str(len(df_filtrado_v)))
+        total_f   = df_filtrado_v["Total"].sum()
+        ticket_f  = df_filtrado_v["Total"].mean() if not df_filtrado_v.empty else 0
+        tot_simples = df_filtrado_v["Cant. Combo Simple"].sum() if "Cant. Combo Simple" in df_filtrado_v.columns else 0
+        tot_dobles  = df_filtrado_v["Cant. Combo Doble"].sum()  if "Cant. Combo Doble"  in df_filtrado_v.columns else 0
+        tot_papas_f = df_filtrado_v["Cantidad Papas"].sum()     if "Cantidad Papas"     in df_filtrado_v.columns else 0
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Total del período",  fmt_currency(total_f))
+        c2.metric("Ticket promedio",    fmt_currency(ticket_f))
+        c3.metric("Combos Simples",     str(int(tot_simples)))
+        c4.metric("Combos Dobles",      str(int(tot_dobles)))
+        c5.metric("Porciones de papas", str(int(tot_papas_f)))
 
         st.dataframe(
-            df_filtrado_v.sort_values("Fecha", ascending=False).reset_index(drop=True),
+            drop_meta(df_filtrado_v.sort_values("Fecha", ascending=False).reset_index(drop=True)),
             use_container_width=True, hide_index=True
         )
 
@@ -859,11 +1093,42 @@ with tabs[4]:
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
         st.markdown("---")
-        with st.expander("🗑️ Eliminar última venta registrada"):
-            if st.button("Eliminar último registro", type="secondary"):
-                save_ventas(df_hv.iloc[:-1])
-                st.success("Último registro eliminado.")
-                st.rerun()
+        with st.expander("🗑️ Eliminar ventas"):
+            df_hv_del = load_ventas()
+            df_hv_del["Fecha"] = pd.to_datetime(df_hv_del["Fecha"], errors="coerce")
+            df_hv_del = df_hv_del.sort_values("Fecha", ascending=False).reset_index(drop=True)
+
+            # Construir etiqueta legible para cada venta
+            def label_venta(row):
+                fecha = row["Fecha"].strftime("%d/%m/%Y") if pd.notna(row["Fecha"]) else "?"
+                cliente = row.get("Cliente", "?")
+                total = fmt_currency(row.get("Total", 0))
+                s = int(row.get("Cant. Combo Simple", 0) or 0)
+                d = int(row.get("Cant. Combo Doble", 0) or 0)
+                p = int(row.get("Cantidad Papas", 0) or 0)
+                detalle = " | ".join(filter(None, [
+                    f"Simple ×{s}" if s else "",
+                    f"Doble ×{d}"  if d else "",
+                    f"Papas ×{p}"  if p else "",
+                ]))
+                return f"{fecha} — {cliente} — {detalle} — {total}"
+
+            etiquetas = df_hv_del.apply(label_venta, axis=1).tolist()
+            opciones_del = {lbl: idx for idx, lbl in enumerate(etiquetas)}
+
+            seleccionadas = st.multiselect(
+                "Seleccioná las ventas que querés eliminar:",
+                options=list(opciones_del.keys()),
+                key="del_ventas_sel"
+            )
+
+            if seleccionadas:
+                st.warning(f"Se eliminarán **{len(seleccionadas)}** venta(s). Esta acción no se puede deshacer.")
+                if st.button("🗑️ Confirmar eliminación", type="secondary", key="confirmar_del_ventas"):
+                    ids_borrar = [int(df_hv_del.loc[opciones_del[lbl], "_id"]) for lbl in seleccionadas]
+                    delete_ventas(ids_borrar)
+                    st.success(f"✅ {len(seleccionadas)} venta(s) eliminada(s).")
+                    st.rerun()
     else:
         st.info("No hay ventas registradas aún.")
 
@@ -896,7 +1161,7 @@ with tabs[5]:
         c2.metric("Registros", str(len(df_filtrado_g)))
 
         st.dataframe(
-            df_filtrado_g.sort_values("Fecha", ascending=False).reset_index(drop=True),
+            drop_meta(df_filtrado_g.sort_values("Fecha", ascending=False).reset_index(drop=True)),
             use_container_width=True, hide_index=True
         )
 
@@ -924,18 +1189,94 @@ with tabs[5]:
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
         st.markdown("---")
-        with st.expander("🗑️ Eliminar último gasto registrado"):
-            if st.button("Eliminar último registro", type="secondary", key="del_gasto"):
-                save_gastos(df_hg.iloc[:-1])
-                st.success("Último registro eliminado.")
-                st.rerun()
+        with st.expander("🗑️ Eliminar gastos"):
+            df_hg_del = load_gastos()
+            df_hg_del["Fecha"] = pd.to_datetime(df_hg_del["Fecha"], errors="coerce")
+            df_hg_del = df_hg_del.sort_values("Fecha", ascending=False).reset_index(drop=True)
+
+            def label_gasto(row):
+                fecha = row["Fecha"].strftime("%d/%m/%Y") if pd.notna(row["Fecha"]) else "?"
+                desc  = row.get("Descripción", "?")
+                cat   = row.get("Categoría", "?")
+                monto = fmt_currency(row.get("Monto", 0))
+                return f"{fecha} — {desc} — {cat} — {monto}"
+
+            etiquetas_g = df_hg_del.apply(label_gasto, axis=1).tolist()
+            opciones_del_g = {lbl: idx for idx, lbl in enumerate(etiquetas_g)}
+
+            seleccionados_g = st.multiselect(
+                "Seleccioná los gastos que querés eliminar:",
+                options=list(opciones_del_g.keys()),
+                key="del_gastos_sel"
+            )
+
+            if seleccionados_g:
+                st.warning(f"Se eliminarán **{len(seleccionados_g)}** gasto(s). Esta acción no se puede deshacer.")
+                if st.button("🗑️ Confirmar eliminación", type="secondary", key="confirmar_del_gastos"):
+                    ids_borrar_g = [int(df_hg_del.loc[opciones_del_g[lbl], "_id"]) for lbl in seleccionados_g]
+                    delete_gastos(ids_borrar_g)
+                    st.success(f"✅ {len(seleccionados_g)} gasto(s) eliminado(s).")
+                    st.rerun()
     else:
         st.info("No hay gastos registrados aún.")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TAB 7 — IMPORTAR EXCEL
+# TAB 7 — PRECIOS
 # ═══════════════════════════════════════════════════════════════════════════════
 with tabs[6]:
+    st.header("💰 Configuración de Precios")
+    st.markdown("Actualizá los precios vigentes. Los cambios se aplican **solo a las ventas nuevas** — las ventas anteriores conservan el precio con el que fueron registradas.")
+
+    precios_cfg = load_precios()
+
+    with st.form("form_precios"):
+        st.subheader("Precios actuales")
+        cp1, cp2, cp3 = st.columns(3)
+        with cp1:
+            nuevo_simple = st.number_input(
+                "Combo Simple ($)",
+                min_value=0.0, step=0.5, format="%.2f",
+                value=float(precios_cfg.get("Combo Simple", 0.0))
+            )
+        with cp2:
+            nuevo_doble = st.number_input(
+                "Combo Doble ($)",
+                min_value=0.0, step=0.5, format="%.2f",
+                value=float(precios_cfg.get("Combo Doble", 0.0))
+            )
+        with cp3:
+            nuevo_papas = st.number_input(
+                "Porción de Papas ($)",
+                min_value=0.0, step=0.5, format="%.2f",
+                value=float(precios_cfg.get("Porción de Papas", 0.0))
+            )
+
+        guardar_precios = st.form_submit_button("💾 Guardar precios", use_container_width=True)
+
+    if guardar_precios:
+        save_precios({
+            "Combo Simple":    round(nuevo_simple, 2),
+            "Combo Doble":     round(nuevo_doble, 2),
+            "Porción de Papas": round(nuevo_papas, 2),
+        })
+        st.success(f"✅ Precios actualizados — Combo Simple: {fmt_currency(nuevo_simple)} | Combo Doble: {fmt_currency(nuevo_doble)} | Papas: {fmt_currency(nuevo_papas)}")
+        st.rerun()
+
+    st.markdown("---")
+    st.subheader("Historial de precios en ventas registradas")
+    df_hv_p = load_ventas()
+    if not df_hv_p.empty and "Precio Combo" in df_hv_p.columns:
+        cols_precio = [c for c in ["Fecha", "Tipo Combo", "Precio Combo", "Precio Papas"] if c in df_hv_p.columns]
+        df_precios_hist = df_hv_p[cols_precio].drop_duplicates().sort_values("Fecha", ascending=False)
+        st.info("Cada venta almacena el precio vigente al momento del registro, por lo que los precios históricos quedan preservados.")
+        st.dataframe(df_precios_hist, use_container_width=True, hide_index=True)
+    else:
+        st.info("Registrá ventas para ver el historial de precios utilizados.")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 8 — IMPORTAR EXCEL
+# ═══════════════════════════════════════════════════════════════════════════════
+with tabs[7]:
     st.header("Importar desde Excel")
     st.markdown("Subí tu planilla Excel para ver los datos históricos. "
                 "Los datos del Excel se muestran aquí pero **no reemplazan** los registros manuales.")
